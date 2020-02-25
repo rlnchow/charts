@@ -1,4 +1,4 @@
-apiVersion: apps/v1beta1
+apiVersion: apps/v1
 kind: Deployment
 metadata:
   labels:
@@ -7,27 +7,44 @@ metadata:
     heritage: {{ .Release.Service }}
     release: {{ .Release.Name }}
   name: {{ template "kibana.fullname" . }}
+{{- if .Values.deployment.annotations }}
+  annotations:
+{{ toYaml .Values.deployment.annotations | indent 4 }}
+{{- end }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ template "kibana.name" . }}
+      release: {{ .Release.Name }}
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
   template:
     metadata:
-    {{- if .Values.podAnnotations }}
       annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+{{- if .Values.podAnnotations }}
 {{ toYaml .Values.podAnnotations | indent 8 }}
-    {{- end }}
+{{- end }}
       labels:
         app: {{ template "kibana.name" . }}
         release: "{{ .Release.Name }}"
+{{- if .Values.podLabels }}
+{{ toYaml .Values.podLabels | indent 8 }}
+{{- end }}
     spec:
-      {{- if .Values.serviceAccountName }}
-      serviceAccountName: {{ .Values.serviceAccountName }}
-      {{- end }}
+      serviceAccountName: {{ template "kibana.serviceAccountName" . }}
       {{- if .Values.priorityClassName }}
       priorityClassName: "{{ .Values.priorityClassName }}"
       {{- end }}
-{{- if .Values.dashboardImport.dashboards }}
+{{- if or (.Values.initContainers) (.Values.dashboardImport.enabled) (.Values.plugins.enabled) }}
       initContainers:
+{{- if .Values.initContainers }}
+{{- range $key, $value := .Values.initContainers }}
+      - name: {{ $key | quote }}
+{{ toYaml $value | indent 8 }}
+{{- end }}
+{{- end }}
+{{- if .Values.dashboardImport.enabled }}
       - name: {{ .Chart.Name }}-dashboardimport
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
         imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -40,13 +57,9 @@ spec:
 {{- end }}
         env:
         {{- range $key, $value := .Values.env }}
-        - name: "{{ $key }}"
-          value: "{{ $value }}"
+        - name: {{ $key | quote }}
+          value: {{ tpl $value $ | quote }}
         {{- end }}
-        ports:
-        - containerPort: {{ .Values.service.internalPort }}
-          name: {{ template "kibana.name" . }}
-          protocol: TCP
         volumeMounts:
         - name: {{ template "kibana.fullname" . }}-dashboards
           mountPath: "/kibanadashboards"
@@ -58,6 +71,63 @@ spec:
           mountPath: "/usr/share/kibana/config/{{ $configFile }}"
           subPath: {{ $configFile }}
         {{- end }}
+{{- end }}
+{{- if .Values.plugins.enabled}}
+      - name: {{ .Chart.Name }}-plugins-install
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command:
+          - /bin/bash
+          - "-c"
+          - |
+            set -e
+            rm -rf plugins/lost+found
+            plugins=(
+            {{- range .Values.plugins.values }}
+            {{ . }}
+            {{- end }}
+            )
+            if {{ .Values.plugins.reset }}
+            then
+              for p in $(./bin/kibana-plugin list | cut -d "@" -f1)
+              do
+                ./bin/kibana-plugin remove ${p}
+              done
+            fi
+            for i in "${plugins[@]}"
+            do
+              IFS=',' read -ra PLUGIN <<< "$i"
+              pluginInstalledCheck=$(./bin/kibana-plugin list | grep "${PLUGIN[0]}" | cut -d '@' -f1 || true)
+              pluginVersionCheck=$(./bin/kibana-plugin list | grep "${PLUGIN[0]}" | cut -d '@' -f2 || true)
+              if [ "${pluginInstalledCheck}" = "${PLUGIN[0]}" ]
+              then
+                if [ "${pluginVersionCheck}" != "${PLUGIN[1]}" ]
+                then
+                  ./bin/kibana-plugin remove "${PLUGIN[0]}"
+                  ./bin/kibana-plugin install "${PLUGIN[2]}"
+                fi
+              else
+                ./bin/kibana-plugin install "${PLUGIN[2]}"
+              fi
+            done
+        env:
+        {{- range $key, $value := .Values.env }}
+        - name: {{ $key | quote }}
+          value: {{ tpl $value $ | quote }}
+        {{- end }}
+        volumeMounts:
+        - name: plugins
+          mountPath: /usr/share/kibana/plugins
+        {{- range $configFile := (keys .Values.files) }}
+        - name: {{ template "kibana.name" $ }}
+          mountPath: "/usr/share/kibana/config/{{ $configFile }}"
+          subPath: {{ $configFile }}
+        {{- end }}
+{{- if .Values.securityContext.enabled }}
+        securityContext:
+          allowPrivilegeEscalation: {{ .Values.securityContext.allowPrivilegeEscalation }}
+{{- end }}
+{{- end }}
 {{- end }}
       containers:
       - name: {{ .Chart.Name }}
@@ -71,9 +141,18 @@ spec:
         {{- end }}
         env:
         {{- range $key, $value := .Values.env }}
-        - name: "{{ $key }}"
-          value: "{{ $value }}"
+        - name: {{ $key | quote }}
+          value: {{ tpl $value $ | quote }}
         {{- end }}
+{{- if .Values.envFromSecrets }}
+        {{- range $key,$value := .Values.envFromSecrets }}
+        - name: {{ $key | upper | quote}}
+          valueFrom:
+            secretKeyRef:
+              name: {{ $value.from.secret | quote}}
+              key: {{ $value.from.key | quote}}
+        {{- end }}
+{{- end }}
 {{- if (not .Values.authProxyEnabled) }}
         ports:
         - containerPort: {{ .Values.service.internalPort }}
@@ -83,7 +162,7 @@ spec:
 {{- if .Values.livenessProbe.enabled }}
         livenessProbe:
           httpGet:
-            path: /status
+            path: {{ .Values.livenessProbe.path }}
             port: {{ .Values.service.internalPort }}
           initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
           timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
@@ -91,13 +170,12 @@ spec:
 {{- if .Values.readinessProbe.enabled }}
         readinessProbe:
           httpGet:
-            path: /status
+            path: {{ .Values.readinessProbe.path }}
             port: {{ .Values.service.internalPort }}
           initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
           timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
-{{- end }}
-{{- with .Values.extraContainers }}
-{{ tpl . $ | indent 6 }}
+          successThreshold: {{ .Values.readinessProbe.successThreshold }}
+          periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
 {{- end }}
         resources:
 {{ toYaml .Values.resources | indent 10 }}
@@ -107,6 +185,21 @@ spec:
           mountPath: "/usr/share/kibana/config/{{ $configFile }}"
           subPath: {{ $configFile }}
         {{- end }}
+{{- if .Values.extraVolumeMounts }}
+{{ toYaml .Values.extraVolumeMounts | indent 8 }}
+{{- end }}
+{{- if .Values.plugins.enabled}}
+        - name: plugins
+          mountPath: /usr/share/kibana/plugins
+{{- end }}
+{{- with .Values.extraContainers }}
+{{ tpl . $ | indent 6 }}
+{{- end }}
+{{- range .Values.extraConfigMapMounts }}
+        - name: {{ .name }}
+          mountPath: {{ .mountPath }}
+          subPath: {{ .subPath }}
+{{- end }}
     {{- if .Values.image.pullSecrets }}
       imagePullSecrets:
 {{ toYaml .Values.image.pullSecrets | indent 8 }}
@@ -121,11 +214,25 @@ spec:
     {{- end }}
       tolerations:
 {{ toYaml .Values.tolerations | indent 8 }}
+{{- if .Values.securityContext.enabled }}
+      securityContext:
+        runAsUser: {{ .Values.securityContext.runAsUser }}
+        fsGroup: {{ .Values.securityContext.fsGroup }}
+{{- end }}
       volumes:
         - name: {{ template "kibana.name" . }}
           configMap:
             name: {{ template "kibana.fullname" . }}
-{{- if .Values.dashboardImport.dashboards }}
+{{- if .Values.plugins.enabled}}
+        - name: plugins
+          {{- if .Values.persistentVolumeClaim.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ template "kibana.fullname" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+{{- end }}
+{{- if .Values.dashboardImport.enabled }}
         - name: {{ template "kibana.fullname" . }}-dashboards
           configMap:
             name: {{ template "kibana.fullname" . }}-dashboards
@@ -133,4 +240,12 @@ spec:
           configMap:
             name: {{ template "kibana.fullname" . }}-importscript
             defaultMode: 0777
+{{- end }}
+{{- range .Values.extraConfigMapMounts }}
+        - name: {{ .name }}
+          configMap:
+            name: {{ .configMap }}
+{{- end }}
+{{- if .Values.extraVolumes }}
+{{ toYaml .Values.extraVolumes | indent 8 }}
 {{- end }}
